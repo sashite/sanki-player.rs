@@ -1,0 +1,28 @@
+[package]
+name = "sashite-sanki-player"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+license = "Apache-2.0"
+description = "Pure, anytime move-decision crate for the Sanki game suite (chess/ogi/xiongqi on 8×8): iterative-deepening alpha-beta over sashite-sanki-engine, built for Sashité."
+repository = "https://github.com/sashite/sanki-player.rs"
+homepage = "https://sashite.com/"
+readme = "README.md"
+keywords = ["chess", "ogi", "xiongqi", "board-game", "game-ai"]
+categories = ["games", "game-development"]
+
+[dependencies]
+sashite-sanki-engine = "0.5"
+
+[dev-dependencies]
+proptest = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
