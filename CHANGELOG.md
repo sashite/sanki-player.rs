@@ -3,6 +3,19 @@
 All notable changes to this crate are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.0] — 2026-07-22
+
+### Changed
+
+- **`sashite-sanki-engine` bumped to 0.6.** The engine's status vocabulary
+  gains `Status::MoveCap` (the absolute 300-move / 600-half-move cap). The crate
+  reaches the engine only through `engine::status`/`apply`/`legal_moves`, and
+  its two `status` matches each carry a catch-all, so the new variant needs no
+  code change and search behaviour is unchanged. The cap is a history-dependent
+  terminal that the position-only `engine::status` never reports; modelling it
+  in the search's draw scoring (alongside the 100-half-move limit) is left to a
+  future evaluation pass.
+
 ## [0.1.0] — 2026-07-20
 
 ### Added
