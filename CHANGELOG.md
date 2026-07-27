@@ -3,6 +3,17 @@
 All notable changes to this crate are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0] — 2026-07-27
+
+### Changed
+
+- **`sashite-sanki-engine` bumped to 0.7** — castling extended to ōgi and
+  xiongqi (deciders' ruling, 2026-07-27; FIDE mechanics, the xiongqi General
+  `G^` in the King's role; canonical initial FEENs gain the `-R` corner
+  markers). The crate reaches the engine only through
+  `engine::status`/`apply`/`legal_moves`, so the search now explores the new
+  castlings without any code change here.
+
 ## [0.2.0] — 2026-07-22
 
 ### Changed
