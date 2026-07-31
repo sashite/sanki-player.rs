@@ -49,7 +49,9 @@ pub struct EvalWeights {
     /// Draw-leaf score in centipoints, from the root side's viewpoint:
     /// positive avoids draws the persona could press, negative steers toward
     /// them (ADR-0015 §4). Unlike the six others this is a direct score, not
-    /// a percentage.
+    /// a percentage. Internally clamped well short of [`Choice::eval_cp`]'s
+    /// mate range, so no magnitude ever lets a draw outrank, or be confused
+    /// with, a genuine checkmate.
     pub contempt: i32,
 }
 

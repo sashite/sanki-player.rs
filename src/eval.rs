@@ -223,3 +223,230 @@ pub fn capture_gain(position: &Position, capturer_side: Side, victim: Piece) -> 
     };
     removal.saturating_add(hand_value(held_letter))
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+    use crate::classify::capture_victim;
+    use sashite_sanki_engine::domain::half_move::Move;
+    use sashite_sanki_engine::engine;
+
+    fn pos(feen: &str) -> Position {
+        Position::parse(feen).expect("fixture FEEN must parse")
+    }
+
+    // --- in_check parameter order (reliability review, 2026-07-31) -----
+    //
+    // `in_check(side, opponent_variant, piece_at)` dispatches the ATTACKING
+    // side's pieces through `opponent_variant`'s table. Empirically, most
+    // piece letters (K, G, Q, R, B, N, I, E, T) are dispatched purely by
+    // their own letter in `sashite_sanki_engine::movement::attack` -- the
+    // variant argument never actually changes their geometry there, because
+    // each letter already belongs to exactly one variant by construction
+    // (only xiongqi ever has `G`/`E`, only ōgi `I`/`T`, only chess `Q`).
+    // The one letter class where `variant` really does change the geometry
+    // is the foot soldier (`P`/`F`/`S` share one dispatch function that
+    // switches on `variant`): a xiongqi Soldier attacks sideways past the
+    // river, a chess Pawn never does. That makes the foot-soldier case the
+    // genuine test of parameter order below (confirmed by direct
+    // experiment: swapping the variant on the flying-general fixture that
+    // follows does NOT change its outcome, so it could not have caught a
+    // backwards parameter order by itself).
+
+    #[test]
+    fn in_check_nudge_fires_only_for_the_real_variant_of_the_attacker() {
+        // Second's xiongqi Soldier on d4 has crossed the river (Second's
+        // gate: `rank <= 3`) and so attacks sideways onto c4/e4 -- but ONLY
+        // under xiongqi rules; the same letter read as a chess Pawn only
+        // attacks diagonally forward (c3/e3), never sideways.
+        let checked = pos("g^7/8/8/8/3sK^3/8/8/8 / W/c");
+        assert_eq!(checked.active_side(), Side::First);
+        let opponent_variant = checked.variant_of(Side::First.flip());
+        assert_eq!(opponent_variant, Variant::Xiongqi);
+        assert!(in_check(Side::First, opponent_variant, |s| checked.piece_at(s)));
+        // Proof the fixture is discriminating: the swapped (mover's own)
+        // variant must miss this exact check.
+        assert!(!in_check(Side::First, Variant::Chess, |s| checked.piece_at(s)));
+
+        let weights = EvalWeights::default();
+        // `mover_moves` pinned identically for both calls below: isolates
+        // the in-check term from the mobility term, which would otherwise
+        // also shift (the King has strictly fewer safe squares once
+        // adjacent to the Soldier).
+        let score_checked = evaluate(&checked, &weights, 0);
+
+        // Safe: the King moved out of the Soldier's reach (different file
+        // and rank from the soldier's sideways/straight attack squares).
+        let safe = pos("g^7/8/8/8/3s3K^/8/8/8 / W/c");
+        assert!(!in_check(Side::First, opponent_variant, |s| safe.piece_at(s)));
+        let score_safe = evaluate(&safe, &weights, 0);
+
+        // The only other per-position terms (material, psq, structure) are
+        // unaffected by the King's own square (royals score 0 material and
+        // are excluded from psq/structure), and shelter is 0 for both (no
+        // friendly neighbours in either fixture) -- so the gap is exactly
+        // the flat 25-centipoint in-check nudge at the default 100% weight.
+        assert_eq!(
+            score_safe.saturating_sub(score_checked),
+            25,
+            "checked={score_checked} safe={score_safe}"
+        );
+    }
+
+    #[test]
+    fn in_check_nudge_fires_for_a_mixed_pairing_flying_general() {
+        // Chess (First) King on the open e-file from a xiongqi (Second)
+        // General: a mixed-pairing check the crate must also get right,
+        // even though (per the comment above) it does not by itself
+        // discriminate the `in_check` parameter order.
+        let checked = pos("4g^3/8/8/8/8/8/8/4K^3 / W/c");
+        let opponent_variant = checked.variant_of(Side::Second);
+        assert!(in_check(Side::First, opponent_variant, |s| checked.piece_at(s)));
+        let weights = EvalWeights::default();
+        let moves_checked = engine::legal_moves(&checked);
+        let score_checked = evaluate(&checked, &weights, moves_checked.len());
+
+        // Safe: King off both the General's file and rank.
+        let safe = pos("4g^3/8/8/8/8/8/8/K^7 / W/c");
+        assert!(!in_check(Side::First, opponent_variant, |s| safe.piece_at(s)));
+        let moves_safe = engine::legal_moves(&safe);
+        let score_safe = evaluate(&safe, &weights, moves_safe.len());
+
+        assert!(
+            score_checked < score_safe,
+            "checked={score_checked} safe={score_safe}"
+        );
+    }
+
+    // --- capture_gain (mirrors sashite-sanki-engine's `capture_transform`
+    // exactly) -------------------------------------------------------------
+
+    #[test]
+    fn capture_gain_ogi_capturing_ogi_tokin_demotes_then_flips() {
+        let position = pos("4k^3/8/8/3t4/8/8/8/3RK^3 / J/j");
+        let m = Move::parse(r#"["d1","d5",null]"#).expect("valid move");
+        let (_, victim) = capture_victim(&position, &m).expect("capture");
+        assert_eq!(victim.kind_letter(), 'T');
+
+        let predicted = capture_gain(&position, Side::First, victim);
+        assert_eq!(
+            predicted,
+            piece_board_value(victim, Variant::Ogi) + hand_value('F')
+        );
+
+        let next = engine::apply(&position, &m).expect("legal capture");
+        let held: Vec<(Piece, usize)> = next.hand(Side::First).collect();
+        assert_eq!(held.len(), 1);
+        let (held_piece, count) = held.first().copied().expect("one entry");
+        assert_eq!(held_piece.kind_letter(), 'F', "the Tokin demotes to a Fu");
+        assert_eq!(held_piece.side(), Side::First, "droppable by the capturer");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn capture_gain_ogi_capturing_a_foreign_piece_becomes_a_fu() {
+        let position = pos("4k^3/8/8/3s4/8/8/8/3RK^3 / J/c");
+        let m = Move::parse(r#"["d1","d5",null]"#).expect("valid move");
+        let (_, victim) = capture_victim(&position, &m).expect("capture");
+        assert_eq!(victim.kind_letter(), 'S');
+
+        let predicted = capture_gain(&position, Side::First, victim);
+        assert_eq!(
+            predicted,
+            piece_board_value(victim, Variant::Xiongqi) + hand_value('F')
+        );
+
+        let next = engine::apply(&position, &m).expect("legal capture");
+        let held: Vec<(Piece, usize)> = next.hand(Side::First).collect();
+        assert_eq!(held.len(), 1);
+        let (held_piece, _count) = held.first().copied().expect("one entry");
+        assert_eq!(held_piece.kind_letter(), 'F');
+        assert_eq!(held_piece.side(), Side::First);
+    }
+
+    #[test]
+    fn capture_gain_non_ogi_capturer_is_inert_board_value_only() {
+        // Chess (capturer) taking a xiongqi piece: identity, no hand term --
+        // the capture_transform doc's "chess or xiongqi capturer: identity
+        // (the opponent's case is kept, hence an inert hand)".
+        let position = pos("4k^3/8/8/3s4/8/8/8/3RK^3 / W/c");
+        let m = Move::parse(r#"["d1","d5",null]"#).expect("valid move");
+        let (_, victim) = capture_victim(&position, &m).expect("capture");
+
+        let predicted = capture_gain(&position, Side::First, victim);
+        assert_eq!(
+            predicted,
+            piece_board_value(victim, Variant::Xiongqi),
+            "no hand gain: the capturer is not ōgi"
+        );
+    }
+
+    // --- hand material term ------------------------------------------------
+
+    #[test]
+    fn hand_material_term_is_exactly_additive() {
+        let weights = EvalWeights::default();
+        let baseline = pos("7k^/8/8/8/8/8/8/K^7 / J/j");
+        let with_rook_in_hand = pos("7k^/8/8/8/8/8/8/K^7 R/ J/j");
+        // `mover_moves` pinned identically for both calls: a droppable Rook
+        // also changes the real legal-move count, which would otherwise
+        // confound the comparison with the mobility term.
+        let score_base = evaluate(&baseline, &weights, 0);
+        let score_hand = evaluate(&with_rook_in_hand, &weights, 0);
+        assert_eq!(
+            score_hand.saturating_sub(score_base),
+            hand_value('R'),
+            "the hand term must add exactly hand_value('R')"
+        );
+    }
+
+    // --- EvalWeights coverage gap (reliability review, 2026-07-31) --------
+    //
+    // Every existing weight-related test above uses `EvalWeights::default`
+    // (every term at 100%); none confirms that a weight of exactly `0`
+    // *fully* disables its term, as the type's own doc comment promises,
+    // rather than merely diminishing it (a `wrapping_div` slip, e.g., could
+    // leave a residual instead of an exact zero).
+
+    #[test]
+    fn material_weight_zero_fully_disables_the_term() {
+        // Two positions differing only by one extra Black pawn on d5. Every
+        // OTHER weight is pinned at 0 too, so with material alone active the
+        // gap must be exactly one pawn's board value, and with material ALSO
+        // at 0 the gap must collapse to exactly zero -- not merely shrink.
+        let baseline = pos("k^7/8/8/8/8/8/8/Q3K^3 / W/w");
+        let extra_pawn = pos("k^7/8/8/3p4/8/8/8/Q3K^3 / W/w");
+
+        let material_only = EvalWeights {
+            material: 100,
+            hand: 0,
+            psq: 0,
+            royal_safety: 0,
+            structure: 0,
+            mobility: 0,
+            contempt: 0,
+        };
+        let gap = evaluate(&baseline, &material_only, 0).saturating_sub(evaluate(
+            &extra_pawn,
+            &material_only,
+            0,
+        ));
+        assert_eq!(
+            gap,
+            crate::values::board_value(Variant::Chess, 'P'),
+            "with every other term off, the gap must be exactly one pawn's value"
+        );
+
+        let material_off_too = EvalWeights {
+            material: 0,
+            ..material_only
+        };
+        assert_eq!(
+            evaluate(&baseline, &material_off_too, 0),
+            evaluate(&extra_pawn, &material_off_too, 0),
+            "material weight 0 must fully disable the term, not merely diminish it"
+        );
+    }
+}

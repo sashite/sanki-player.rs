@@ -25,13 +25,31 @@ use crate::api::{Choice, Context, EvalWeights, Limits, Occurrences, Strength};
 use crate::classify::{capture_victim, is_promotion, resets_halfmove_clock};
 use crate::eval::{capture_gain, evaluate};
 use crate::prng::SplitMix64;
-use crate::tt::{Bound, Entry, Table};
+use crate::tt::{Bound, Entry, Table, MATE_WINDOW};
 use crate::values::piece_board_value;
 
 /// The mate score anchor: a mate found `d` plies from the root scores
 /// `MATE − d` (or its negation for the mated side), so faster mates rank
 /// higher and longer resistance ranks less badly.
 pub const MATE: i32 = 30_000;
+
+/// The largest-magnitude score a **non-mate** leaf (a draw, or the
+/// quiescence stand-pat) may ever return: one less than `tt`'s own
+/// mate-detection threshold (`MATE − MATE_WINDOW`).
+///
+/// `EvalWeights` — every percentage weight, and `contempt` most directly, as
+/// it is added raw rather than scaled — is caller-supplied and unbounded.
+/// Without this clamp an extreme value (a large-magnitude `contempt` is the
+/// simplest trigger) can push a mere draw's score at or beyond `MATE`
+/// itself, so it out-ranks a genuine, closer checkmate at the root — or, if
+/// the inflated score reaches the table's mate window, gets spuriously
+/// ply-shifted on a store/probe round trip through [`Table`] as though it
+/// really were mate-distance-dependent (ADR-0015 §3/§4). Clamping every
+/// non-mate leaf keeps the table's magnitude-based mate/non-mate split, and
+/// the root's mate-vs-draw ranking, valid regardless of how extreme the
+/// persona is — never by narrowing what a sane persona can express (no real
+/// evaluation or contempt approaches five figures).
+const NON_MATE_BOUND: i32 = MATE - MATE_WINDOW - 1;
 
 /// The threefold-repetition threshold, initial position included — the
 /// kernel's own convention.
@@ -65,13 +83,22 @@ fn square_index(square: Square) -> u8 {
         .saturating_add(square.file())
 }
 
+/// The board material shape [`Searcher::dead_draw`]'s cheap gate inspects —
+/// see that method's doc for why `all_bishops` exists alongside the count.
+struct DeadGateMaterial {
+    non_royal_count: u32,
+    all_bishops: bool,
+}
+
 struct Searcher<'a> {
     weights: &'a EvalWeights,
     occurrences: &'a Occurrences,
     root_side: Side,
     contempt: i32,
-    /// Dead-position probing is enabled only when neither side plays ōgi
-    /// (pure ōgi has no dead-position rule, and a hand refutes insufficiency).
+    /// Dead-position probing is disabled only for *pure* ōgi (both sides):
+    /// that pairing alone has no dead-position rule. A mixed pairing with
+    /// exactly one ōgi side keeps the mixed rule (only royals, no droppable
+    /// hand), so the gate stays armed there.
     dead_gate: bool,
     tt: Table,
     killers: Vec<[Option<Move>; 2]>,
@@ -88,7 +115,11 @@ struct Searcher<'a> {
 impl<'a> Searcher<'a> {
     fn new(ctx: &Context<'a>, strength: &'a Strength, limits: &Limits<'a>) -> Self {
         let variants = ctx.position.variants();
-        let dead_gate = variants.first != Variant::Ogi && variants.second != Variant::Ogi;
+        // Off only for *pure* ōgi (both sides): that pairing alone has no
+        // dead-position rule at all. A mixed pairing with exactly one ōgi
+        // side still has the mixed rule (only royals, no droppable hand),
+        // so the gate must stay on whenever *either* side is not ōgi.
+        let dead_gate = variants.first != Variant::Ogi || variants.second != Variant::Ogi;
         Self {
             weights: &strength.weights,
             occurrences: ctx.occurrences,
@@ -125,12 +156,15 @@ impl<'a> Searcher<'a> {
     /// The draw score from the node mover's viewpoint, anchored at the root
     /// side (ADR-0015 §4): `−contempt` for the root side, `+contempt` for
     /// its opponent — the same leaf must not look draw-attractive to both.
+    /// Clamped to [`NON_MATE_BOUND`]: an extreme `contempt` must never let a
+    /// draw masquerade as, or outrank, a genuine mate.
     fn draw_score(&self, node_mover: Side) -> i32 {
-        if node_mover == self.root_side {
+        let raw = if node_mover == self.root_side {
             self.contempt.saturating_neg()
         } else {
             self.contempt
-        }
+        };
+        raw.clamp(NON_MATE_BOUND.saturating_neg(), NON_MATE_BOUND)
     }
 
     /// The total occurrence count of `feen`: game history plus search path.
@@ -155,10 +189,23 @@ impl<'a> Searcher<'a> {
 
     /// Dead-position probe (ADR-0015 §3): a draw the arbiter calls while
     /// moves remain, so it is tested at **every** node — behind a cheap
-    /// material gate (an over-approximation of every per-variant dead
-    /// configuration; never fires in ōgi).
-    fn dead_draw(&self, position: &Position, non_royal_count: u32) -> bool {
-        if !self.dead_gate || non_royal_count > 2 {
+    /// material gate (an over-approximation of every per-variant and mixed
+    /// dead configuration; never fires in *pure* ōgi, see [`Self::dead_gate`]).
+    ///
+    /// The gate passes when `non_royal_count <= 2` **or** every non-royal
+    /// piece on the board is a Bishop. The `<= 2` half covers every
+    /// bounded-count case (King-vs-King, King+Bishop-vs-King,
+    /// King+Knight-vs-King; pure xiongqi's and every mixed pairing's
+    /// bare-royals rule) — but pure chess's "Kings and Bishops only, all the
+    /// same colour" dead position (the engine's own `chess_material_is_dead`)
+    /// has **no bound on Bishop count**, so a fixed cutoff alone would
+    /// silently skip the authoritative probe once a third same-coloured
+    /// Bishop appeared, understating a genuine draw as a material edge
+    /// (regression: `dead_draw_gate_recognizes_more_than_two_same_coloured_bishops`,
+    /// `tests/tactics.rs`). Any count of Bishops-only material is let
+    /// through instead; the engine itself still decides same-colour-ness.
+    fn dead_draw(&self, position: &Position, material: DeadGateMaterial) -> bool {
+        if !self.dead_gate || (material.non_royal_count > 2 && !material.all_bishops) {
             return false;
         }
         matches!(
@@ -170,16 +217,29 @@ impl<'a> Searcher<'a> {
         )
     }
 
-    /// Non-royal piece count (board only — the gate is disabled whenever a
-    /// hand could exist).
-    fn non_royal_count(position: &Position) -> u32 {
-        let mut count = 0_u32;
+    /// The board-only non-royal material shape [`Self::dead_draw`]'s gate
+    /// needs: how many non-royal pieces are present, and whether every one
+    /// of them is a Bishop (hand pieces never enter this: the gate is
+    /// disabled whenever a hand could exist).
+    fn dead_gate_material(position: &Position) -> DeadGateMaterial {
+        let mut non_royal_count = 0_u32;
+        let mut all_bishops = true;
         for square in Square::all() {
-            if position.piece_at(square).is_some_and(|p| !p.is_royal()) {
-                count = count.saturating_add(1);
+            let Some(piece) = position.piece_at(square) else {
+                continue;
+            };
+            if piece.is_royal() {
+                continue;
+            }
+            non_royal_count = non_royal_count.saturating_add(1);
+            if piece.kind_letter() != 'B' {
+                all_bishops = false;
             }
         }
-        count
+        DeadGateMaterial {
+            non_royal_count,
+            all_bishops,
+        }
     }
 
     /// Heuristic ordering score for `mv` at `ply` (higher searches first).
@@ -258,14 +318,18 @@ impl<'a> Searcher<'a> {
         if self.aborted {
             return 0;
         }
-        if self.dead_draw(position, Self::non_royal_count(position)) {
+        if self.dead_draw(position, Self::dead_gate_material(position)) {
             return self.draw_score(position.active_side());
         }
         let mut moves = engine::legal_moves(position);
         if moves.is_empty() {
             return self.terminal_score(position, ply);
         }
-        let stand_pat = evaluate(position, self.weights, moves.len());
+        // Clamped to `NON_MATE_BOUND`: an extreme `EvalWeights` must never
+        // let a static evaluation masquerade as, or outrank, a genuine mate
+        // (see `NON_MATE_BOUND`'s doc — the same reasoning as `draw_score`).
+        let stand_pat = evaluate(position, self.weights, moves.len())
+            .clamp(NON_MATE_BOUND.saturating_neg(), NON_MATE_BOUND);
         if stand_pat >= beta {
             return stand_pat;
         }
@@ -339,7 +403,7 @@ impl<'a> Searcher<'a> {
             return (self.draw_score(position.active_side()), true);
         }
         // Dead position: a draw called while moves remain — every node.
-        if self.dead_draw(position, Self::non_royal_count(position)) {
+        if self.dead_draw(position, Self::dead_gate_material(position)) {
             return (self.draw_score(position.active_side()), false);
         }
 
@@ -463,6 +527,53 @@ fn attacker_value(position: &Position, mv: &Move) -> i64 {
 struct RootMove {
     mv: Move,
     score: i32,
+    /// Whether `score` is a true value (raised the root's running `alpha`)
+    /// rather than a mere upper bound returned by a child that failed high —
+    /// see the two-pass root search in [`choose`].
+    exact: bool,
+}
+
+/// Scores `mv` from the root: applies it, searches the child to `depth − 1`
+/// with an open lower side and `beta` on the upper side, and returns the
+/// negated result.
+///
+/// `beta` is handed straight to [`Searcher::negamax`] with no further
+/// negation — callers pass either the root's running `alpha` (negated, to
+/// narrow the common case) or a fully open bound (to re-search a move
+/// whose earlier score cannot be trusted as exact).
+///
+/// Returns `None` if the move fails to apply (defensive; unreachable for a
+/// legal move) or if the search aborts under the caller's limits —
+/// `searcher.aborted` tells the two outcomes apart.
+fn root_score(
+    searcher: &mut Searcher<'_>,
+    ctx: &Context<'_>,
+    mv: &Move,
+    depth: u8,
+    beta: i32,
+) -> Option<i32> {
+    let child = engine::apply(ctx.position, mv).ok()?;
+    let child_feen = child.to_feen();
+    let child_clock = if resets_halfmove_clock(ctx.position, mv) {
+        0
+    } else {
+        ctx.halfmove_clock.saturating_add(1)
+    };
+    increment(&mut searcher.path, &child_feen);
+    let (child_score, _) = searcher.negamax(
+        &child,
+        &child_feen,
+        depth.saturating_sub(1),
+        1,
+        i32::MIN.saturating_add(1),
+        beta,
+        child_clock,
+    );
+    decrement(&mut searcher.path, &child_feen);
+    if searcher.aborted {
+        return None;
+    }
+    Some(child_score.saturating_neg())
 }
 
 /// The best move, or `None` iff the position has no legal move
@@ -477,7 +588,11 @@ pub fn choose(ctx: &Context<'_>, strength: &Strength, limits: &Limits<'_>) -> Op
         moves.sort_by_key(move_key);
         moves
             .into_iter()
-            .map(|mv| RootMove { mv, score: 0 })
+            .map(|mv| RootMove {
+                mv,
+                score: 0,
+                exact: false,
+            })
             .collect()
     };
     if root_moves.is_empty() {
@@ -495,37 +610,57 @@ pub fn choose(ctx: &Context<'_>, strength: &Strength, limits: &Limits<'_>) -> Op
         let mut alpha = i32::MIN.saturating_add(1);
         let mut aborted = false;
 
+        // First pass: the usual narrowed search. A move that raises `alpha` was
+        // searched with an open upper side and comes back with its **value**;
+        // a move that does not raise it fails high in the child and comes back
+        // with an upper **bound** — which is why `exact` is tracked.
         for root in &root_moves {
-            let Ok(child) = engine::apply(ctx.position, &root.mv) else {
+            let Some(score) =
+                root_score(&mut searcher, ctx, &root.mv, depth, alpha.saturating_neg())
+            else {
+                if searcher.aborted {
+                    aborted = true;
+                    break;
+                }
                 continue;
             };
-            let child_feen = child.to_feen();
-            let child_clock = if resets_halfmove_clock(ctx.position, &root.mv) {
-                0
-            } else {
-                ctx.halfmove_clock.saturating_add(1)
-            };
-            increment(&mut searcher.path, &child_feen);
-            let (child_score, _) = searcher.negamax(
-                &child,
-                &child_feen,
-                depth.saturating_sub(1),
-                1,
-                i32::MIN.saturating_add(1),
-                alpha.saturating_neg(),
-                child_clock,
-            );
-            decrement(&mut searcher.path, &child_feen);
-            if searcher.aborted {
-                aborted = true;
-                break;
-            }
-            let score = child_score.saturating_neg();
+            let exact = score > alpha;
             alpha = alpha.max(score);
             iteration.push(RootMove {
                 mv: root.mv.clone(),
                 score,
+                exact,
             });
+        }
+
+        if aborted {
+            break;
+        }
+
+        // Second pass: rescue the ties.
+        //
+        // Fail-soft can return an upper bound *exactly equal* to the best
+        // score, and recording that bound as though it were a value is what
+        // let a losing move into `equal_best` — in a chess-versus-ōgi position
+        // where only `c2→b1` mates in 2, `c2→c1`, `c2→d1` and `b2→c3` all came
+        // back at `MATE − 3`, and three seeds out of four threw the mate away.
+        // A bound below the best is harmless (the true value is lower still);
+        // only a bound *equal* to it can be a genuine tie, so only those are
+        // re-searched, with the window open. The scores ADR-0015 §6 hands to
+        // the tie-break are then values, not bounds — and the pruning the first
+        // pass bought is kept everywhere it cannot mislead.
+        if let Some(best) = iteration.iter().map(|entry| entry.score).max() {
+            for entry in &mut iteration {
+                if entry.exact || entry.score < best {
+                    continue;
+                }
+                let Some(score) = root_score(&mut searcher, ctx, &entry.mv, depth, i32::MAX) else {
+                    aborted = true;
+                    break;
+                };
+                entry.score = score;
+                entry.exact = true;
+            }
         }
 
         if aborted {
