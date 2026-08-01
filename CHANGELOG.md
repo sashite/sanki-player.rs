@@ -3,6 +3,33 @@
 All notable changes to this crate are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.0] — 2026-08-01
+
+`sashite-sanki-engine` bumped to 0.9, which carries the whole notation stack
+with it. **No search or evaluation changes**: the tactics suite, the root
+tie-break suite and the property suite all pass exactly as before, and no
+source file needed an edit.
+
+### Changed
+
+- **`sashite-sanki-engine` 0.8 → 0.9.** The engine moved onto `sashite-feen`
+  0.2 and `sashite-qi` 0.2, and hardened `Position::new`, which now rejects any
+  board that is not 8×8 with a new `PositionError::NotSankiBoard` variant.
+  `sashite-sin`, `sashite-pin` and `sashite-epin` reach 1.1 in the lockfile.
+
+  This crate never builds a `Position` itself — one arrives borrowed in
+  `Context` — so the stricter constructor changes nothing here. It does use
+  `Position::to_feen` heavily: the repetition key in `search`, the transposition
+  probe, and `Occurrences` are all keyed by the FEEN string. Those keys are
+  byte-identical to before; what changed underneath is that the encoder can no
+  longer produce a string FEEN's own parser would reject, and that the 8×8
+  invariant it relies on is now enforced at construction rather than assumed.
+
+  This is a minor bump rather than a patch because `Context::position` is an
+  `&sashite_sanki_engine::Position` and `Choice` carries the engine's `Move`, so
+  the engine's own breaking change is visible in this crate's public API:
+  dependents must move to engine 0.9 as well.
+
 ## [0.4.1] — 2026-07-31
 
 ### Fixed
