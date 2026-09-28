@@ -3,6 +3,28 @@
 All notable changes to this crate are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.0] — 2026-09-28
+
+`sashite-sanki-engine` bumped from 0.9 to 0.12. **No search or evaluation
+changes**: the tactics suite, the root tie-break suite and the property suite
+pass exactly as before, and no source file needed an edit.
+
+### Changed
+
+- **`sashite-sanki-engine` 0.9 → 0.12.** Three minor releases of the engine
+  since 0.9, none of which touches what this crate reads: 0.10 published the
+  attack relation beside `is_attacked`; 0.11 made the engine both sides of the
+  `sanki` rule system (`rules`, `ggn`, `apply_ply`, the manifest and its
+  verification) and made `clock::tick` iterative; 0.12 gave it the canonical
+  PMN of every legal move (`pmn`, for the Sashité Engine Interface) and
+  `pmn::well_formed`. Legal moves, `apply`, `status` and `to_feen` — the
+  four calls the search rests on — are unchanged.
+
+  A minor bump, as for 0.5.0: `Context::position` and `Choice::mv` are the
+  engine's own types, so the engine's version is visible in this crate's
+  public API. A consumer on engine 0.12 — `sanki-sei-player`, the SEI engine
+  built on this crate — can now hold one version of the engine.
+
 ## [0.5.0] — 2026-08-01
 
 `sashite-sanki-engine` bumped to 0.9, which carries the whole notation stack
